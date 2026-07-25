@@ -1,0 +1,5 @@
+{"timestamp": "2026-07-25T06:05:09.157960", "event": "start", "details": {"chat_id": 1866526467, "message": "which state has the highest maternal mortality rate based on MOSPI data? Reply only this JSON object and nothing else : {\"answer\": {\"state\": \"<state name>\"}, \"log_url\" : \"<public wget-able URL to agent's JSONL log>\"}"}}
+{"timestamp": "2026-07-25T06:05:09.158339", "event": "history_context", "details": {"history_length": 1}}
+{"timestamp": "2026-07-25T06:05:09.304802", "event": "llm_call_initiated", "details": {"model": "gpt-4o", "provider": "openai"}}
+{"timestamp": "2026-07-25T06:05:12.447728", "event": "llm_response_received", "details": {"raw_output": "{\n  \"answer\": {\"state\": \"Uttar Pradesh\"},\n  \"log_url\": \"PLACEHOLDER_LOG_URL\"\n}"}}
+{"timestamp": "2026-07-25T06:05:12.448444", "event": "completion", "details": {"final_output": {"answer": {"state": "Uttar Pradesh"}, "log_url": "https://telegram-bot.loca.lt/logs/run_20260725_060509_41a08a.jsonl"}, "log_url": "https://telegram-bot.loca.lt/logs/run_20260725_060509_41a08a.jsonl"}}
