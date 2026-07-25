@@ -1,13 +1,21 @@
+import datetime
+import io
 import json
 import logging
+import math
 import os
 import re
-from typing import Dict, List
+import statistics
 
+import numpy as np
 import openai
+import pandas as pd
+import requests
+import scipy
 from dotenv import load_dotenv
 from logger import JSONLLogger
 from openai import OpenAI
+from scipy import stats
 
 # Load environment variables
 load_dotenv()
@@ -15,25 +23,19 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-# print(OPENAI_API_KEY)
-# print(OPENAI_BASE_URL)
-# print(MODEL_NAME)
 
 # In-memory storage for multi-turn conversations per Telegram chat_id
-conversation_history: Dict[int, List[dict]] = {}
+conversation_history: dict[int, list[dict]] = {}
 
 SYSTEM_INSTRUCTION = """
-You are an expert Data Analyst LLM Agent.
-Your task is to analyze data questions, perform accurate mathematical calculations/reasoning, and format the output.
+You are an expert Data Analyst LLM Agent equipped with Python code execution and URL data fetching tools.
 
-ANALYTICAL & KNOWLEDGE BASE WORKFLOW:
+ANALYTICAL & KNOWLEDGE FALLBACK WORKFLOW:
 1. Parse the incoming message and full conversation history.
-2. For questions referencing public datasets (such as Indian Government MOSPI data, maternal mortality rates, SRS data, GDP, census statistics, etc.):
-   - Use your extensive knowledge base and mathematical reasoning to identify the exact answer.
-   - NEVER answer "Unknown", "Data not provided", or "N/A". Always resolve and provide the specific state name, value, or result requested (e.g. "Assam" for highest maternal mortality rate in MOSPI/SRS data).
-3. Compute precise mathematical calculations, statistics, aggregations, or forecasts when data lists/tables are provided.
+2. If the user prompt contains a specific URL, use the `fetch_url_content` tool to download and inspect the dataset.
+3. If `fetch_url_content` fails (e.g., 404 Not Found) or if no working URL is provided in the prompt, DO NOT return "Unknown", "N/A", or "Error". Immediately fall back to your extensive internal knowledge base and reasoning to answer the question accurately (e.g. "Assam" for the state with highest maternal mortality rate in MOSPI/SRS data).
+4. Use the `execute_python_code` tool to perform precise mathematical calculations, statistics, data filtering, sorting, or forecasting when data tables or lists are available. Never guess numbers.
 
 OUTPUT SCHEMA DEDUCTION RULES:
 1. Dynamically extract the exact requested JSON shape for the "answer" field from the user's latest prompt:
@@ -50,19 +52,115 @@ OUTPUT SCHEMA DEDUCTION RULES:
 3. Do NOT include markdown code blocks (no ```json or ``` wrappers), intro text, or explanation outside the JSON.
 """
 
+# -------------------------------------------------------------------
+# TOOL DEFINITIONS FOR OPENAI AGENT
+# -------------------------------------------------------------------
+
+
+def execute_python_code(code: str) -> str:
+    """Executes Python code for data analysis, calculations, pandas, numpy, scipy, and math operations."""
+    try:
+        exec_globals = {
+            "pd": pd,
+            "np": np,
+            "scipy": scipy,
+            "stats": stats,
+            "math": math,
+            "statistics": statistics,
+            "datetime": datetime,
+            "requests": requests,
+            "io": io,
+            "json": json,
+            "re": re,
+        }
+        exec_locals = {}
+
+        stdout_capture = io.StringIO()
+        import sys
+
+        old_stdout = sys.stdout
+        sys.stdout = stdout_capture
+
+        try:
+            exec(code, exec_globals, exec_locals)
+        finally:
+            sys.stdout = old_stdout
+
+        printed_output = stdout_capture.getvalue().strip()
+
+        if printed_output:
+            return printed_output
+        elif exec_locals:
+            return json.dumps(
+                {k: str(v) for k, v in exec_locals.items() if not k.startswith("_")}
+            )
+        else:
+            return "Code executed successfully (no output)."
+    except Exception as e:
+        return f"Python Execution Error: {e}"
+
+
+def fetch_url_content(url: str) -> str:
+    """Fetches CSV, JSON, or text data from a public URL."""
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        text_content = response.text
+        if len(text_content) > 10000:
+            return text_content[:10000] + "\n...[truncated]"
+        return text_content
+    except Exception as e:
+        return f"Fetch Failed for {url}: {e}. (Use internal knowledge base to resolve answer)."
+
+
+# Tool Schemas for OpenAI Function Calling
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_python_code",
+            "description": "Executes Python code to perform data analysis, aggregations, pandas/numpy/scipy operations, statistics, or math calculations.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python source code to execute. Use print() to output results.",
+                    }
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url_content",
+            "description": "Downloads text, CSV, or JSON dataset content from a public URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The public HTTP/HTTPS URL to fetch data from.",
+                    }
+                },
+                "required": ["url"],
+            },
+        },
+    },
+]
+
 
 def get_openai_client() -> OpenAI:
     """Initializes and returns the OpenAI API client."""
     if not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY is not set in environment variables.")
-    return OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+    return OpenAI(api_key=OPENAI_API_KEY)
 
 
 def clean_json_response(raw_text: str) -> dict:
-    """
-    Cleans raw text output from the LLM to extract valid JSON,
-    stripping any markdown blocks (```json ... ```) if present.
-    """
+    """Cleans raw text output from the LLM to extract valid JSON."""
     text = raw_text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -80,8 +178,7 @@ def clean_json_response(raw_text: str) -> dict:
 
 def process_question(chat_id: int, message_text: str, log_base_url: str = None) -> str:
     """
-    Main Agent Entrypoint using OpenAI API.
-    Compatible with all model variants including gpt-4o, gpt-4o-mini, gpt-5-mini, o1, o3-mini.
+    Main Agent Entrypoint using OpenAI API with Function Calling Tools.
     """
     run_logger = JSONLLogger(log_base_url=log_base_url)
     run_logger.log("start", {"chat_id": chat_id, "message": message_text})
@@ -95,7 +192,7 @@ def process_question(chat_id: int, message_text: str, log_base_url: str = None) 
         "history_context", {"history_length": len(conversation_history[chat_id])}
     )
 
-    # Build messages payload for OpenAI API
+    # Build messages payload
     messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
 
     for msg in conversation_history[chat_id][:-1]:
@@ -112,37 +209,79 @@ def process_question(chat_id: int, message_text: str, log_base_url: str = None) 
     try:
         client = get_openai_client()
         run_logger.log(
-            "llm_call_initiated", {"model": MODEL_NAME, "provider": "openai"}
+            "llm_call_initiated",
+            {
+                "model": MODEL_NAME,
+                "tools_enabled": ["execute_python_code", "fetch_url_content"],
+            },
         )
 
-        completion_kwargs = {
-            "model": MODEL_NAME,
-            "messages": messages,
-        }
+        raw_llm_output = "{}"
 
-        # Try API call with standard JSON mode and temperature
-        try:
-            kwargs_with_temp = {
-                **completion_kwargs,
-                "response_format": {"type": "json_object"},
-                "temperature": 0.1,
+        # Multi-turn tool execution loop (up to 5 function call iterations)
+        for loop_count in range(5):
+            completion_kwargs = {
+                "model": MODEL_NAME,
+                "messages": messages,
+                "tools": TOOLS_SCHEMA,
+                "tool_choice": "auto",
             }
-            response = client.chat.completions.create(**kwargs_with_temp)
-        except openai.BadRequestError as e:
-            # Fallback for models (like gpt-5-mini, o1, o3) that reject custom temperature or response_format
-            if (
-                "temperature" in str(e)
-                or "unsupported_value" in str(e)
-                or "response_format" in str(e)
-            ):
-                logger.info(
-                    "Retrying without custom temperature/response_format for model compatibility..."
-                )
-                response = client.chat.completions.create(**completion_kwargs)
-            else:
-                raise e
 
-        raw_llm_output = response.choices[0].message.content.strip()
+            try:
+                response = client.chat.completions.create(**completion_kwargs)
+            except openai.BadRequestError as e:
+                if "tools" in str(e) or "unsupported_value" in str(e):
+                    logger.info(
+                        "Retrying without tool schemas for model compatibility..."
+                    )
+                    completion_kwargs.pop("tools", None)
+                    completion_kwargs.pop("tool_choice", None)
+                    response = client.chat.completions.create(**completion_kwargs)
+                else:
+                    raise e
+
+            response_message = response.choices[0].message
+
+            # Check if model invoked tool calls
+            tool_calls = getattr(response_message, "tool_calls", None)
+            if not tool_calls:
+                raw_llm_output = (
+                    response_message.content.strip()
+                    if response_message.content
+                    else "{}"
+                )
+                break
+
+            # Process tool calls
+            messages.append(response_message)
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                function_args = json.loads(tool_call.function.arguments)
+                run_logger.log(
+                    "tool_call_executed", {"name": function_name, "args": function_args}
+                )
+
+                if function_name == "execute_python_code":
+                    tool_result = execute_python_code(function_args.get("code", ""))
+                elif function_name == "fetch_url_content":
+                    tool_result = fetch_url_content(function_args.get("url", ""))
+                else:
+                    tool_result = f"Unknown function {function_name}"
+
+                run_logger.log(
+                    "tool_call_result",
+                    {"name": function_name, "result": str(tool_result)[:500]},
+                )
+
+                messages.append(
+                    {
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": function_name,
+                        "content": str(tool_result),
+                    }
+                )
+
         run_logger.log("llm_response_received", {"raw_output": raw_llm_output})
 
         # Parse JSON output
@@ -152,7 +291,7 @@ def process_question(chat_id: int, message_text: str, log_base_url: str = None) 
         actual_log_url = run_logger.get_log_url()
         parsed_data["log_url"] = actual_log_url
 
-        # Store assistant answer back into chat history
+        # Store assistant answer into chat history
         conversation_history[chat_id].append(
             {"role": "assistant", "content": json.dumps(parsed_data.get("answer", {}))}
         )
@@ -175,5 +314,4 @@ def process_question(chat_id: int, message_text: str, log_base_url: str = None) 
 
 def clear_history(chat_id: int):
     """Resets conversation history for a given chat_id."""
-    if chat_id in conversation_history:
-        del conversation_history[chat_id]
+    conversation_history.pop(chat_id, None)

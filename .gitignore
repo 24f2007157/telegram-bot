@@ -12,5 +12,6 @@ wheels/
 # Environment variables
 .env
 
-# Static Folder
-static/
+# Static Folder Logs
+*.jsonl
+
