@@ -1,4 +1,0 @@
-{"timestamp": "2026-07-25T06:14:29.236590", "event": "start", "details": {"chat_id": 1866526467, "message": "which state has the highest maternal mortality rate based on MOSPI data? Reply only this JSON object and nothing else : {\"answer\": {\"state\": \"<state name>\"}, \"log_url\" : \"<public wget-able URL to agent's JSONL log>\"}"}}
-{"timestamp": "2026-07-25T06:14:29.238003", "event": "history_context", "details": {"history_length": 1}}
-{"timestamp": "2026-07-25T06:14:29.259648", "event": "llm_call_initiated", "details": {"model": "gpt-5-mini", "provider": "openai"}}
-{"timestamp": "2026-07-25T06:14:31.588727", "event": "error", "details": {"error_message": "name 'BadRequestError' is not defined"}}
