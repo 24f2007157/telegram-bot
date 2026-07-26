@@ -1,9 +1,16 @@
 import json
 import os
+import tempfile
 import uuid
 from datetime import datetime
 
-LOG_DIR = os.path.join(os.path.dirname(__file__), "static", "logs")
+# In serverless environments (Vercel / AWS Lambda), the app root (/var/task) is READ-ONLY.
+# The only writable directory is /tmp.
+if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+    LOG_DIR = os.path.join(tempfile.gettempdir(), "logs")
+else:
+    LOG_DIR = os.path.join(os.path.dirname(__file__), "static", "logs")
+
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
