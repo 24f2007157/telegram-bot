@@ -64,7 +64,6 @@ def search_web_online(query: str) -> str:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
-        # 1. DuckDuckGo HTML Search for zero-key web search
         search_url = (
             f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
         )
@@ -80,7 +79,6 @@ def search_web_online(query: str) -> str:
                     [f"- {s}" for s in clean_snippets]
                 )
 
-        # 2. Wikipedia API Search fallback
         wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={requests.utils.quote(query)}&format=json"
         w_res = requests.get(wiki_url, headers=headers, timeout=10).json()
         search_hits = w_res.get("query", {}).get("search", [])
@@ -247,7 +245,8 @@ def clean_json_response(raw_text: str) -> dict:
         match = re.search(r"(\{.*\})", text, re.DOTALL)
         if match:
             return json.loads(match.group(1))
-        raise ValueError(f"Could not parse valid JSON from text: {raw_text}")
+        # Fallback if raw output is empty or non-JSON
+        return {"answer": {"result": text or "Processed"}}
 
 
 def process_question(chat_id: int, message_text: str, log_base_url: str = None) -> str:
@@ -294,10 +293,10 @@ def process_question(chat_id: int, message_text: str, log_base_url: str = None) 
             },
         )
 
-        raw_llm_output = "{}"
+        raw_llm_output = ""
 
-        # Multi-turn tool execution loop (up to 5 function call iterations)
-        for loop_count in range(5):
+        # Tool execution loop (up to 4 function call iterations)
+        for loop_count in range(4):
             completion_kwargs = {
                 "model": MODEL_NAME,
                 "messages": messages,
@@ -319,18 +318,16 @@ def process_question(chat_id: int, message_text: str, log_base_url: str = None) 
                     raise e
 
             response_message = response.choices[0].message
-
-            # Check if model invoked tool calls
             tool_calls = getattr(response_message, "tool_calls", None)
+
             if not tool_calls:
+                # Model provided direct text response
                 raw_llm_output = (
-                    response_message.content.strip()
-                    if response_message.content
-                    else "{}"
+                    response_message.content.strip() if response_message.content else ""
                 )
                 break
 
-            # Process tool calls
+            # Append assistant message with tool calls to context
             messages.append(response_message)
             for tool_call in tool_calls:
                 function_name = tool_call.function.name
@@ -361,6 +358,23 @@ def process_question(chat_id: int, message_text: str, log_base_url: str = None) 
                         "content": str(tool_result),
                     }
                 )
+
+        # If loop reached max tool calls without final text output, force one final LLM call without tools
+        if not raw_llm_output:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Synthesize all collected tool search results above and return ONLY the final JSON object matching the requested schema.",
+                }
+            )
+            final_res = client.chat.completions.create(
+                model=MODEL_NAME, messages=messages
+            )
+            raw_llm_output = (
+                final_res.choices[0].message.content.strip()
+                if final_res.choices[0].message.content
+                else "{}"
+            )
 
         run_logger.log("llm_response_received", {"raw_output": raw_llm_output})
 
