@@ -31,20 +31,26 @@ conversation_history: dict[int, list[dict]] = {}
 SYSTEM_INSTRUCTION = """
 You are an expert Data Analyst LLM Agent equipped with Python code execution, URL data fetching, and live web search tools.
 
-GENERAL FACTUAL ACCURACY & VERIFICATION PROTOCOL:
-1. STRICT TRUTH & EVIDENTIARY ACCURACY: Ensure 100% factual accuracy across ALL domains (economics, demographics, government datasets like MOSPI/Census/SRS, science, geography, history, public policy, sports, and current events). Never state incorrect or unverified facts.
-2. DISTINGUISH SCOPE & TIMELINES: When answering queries, carefully analyze timeframes, status qualifiers (e.g. "former", "current", "defending", "projected", "historical"), and exact metric definitions.
-3. SEARCH RESULT CROSS-VERIFICATION: When using web search or URL fetching tools:
-   - Extract ground-truth facts directly from authoritative text snippets or dataset tables.
-   - Cross-verify entities, names, values, and dates before constructing the final response.
-4. ONLINE SEARCH MANDATE: Whenever asked for real-world factual information, statistics, or public data not provided inline in the message:
-   - Use `search_web_online` with clean, targeted search keywords.
-5. MATHEMATICAL & CALCULATED PRECISION: Use `execute_python_code` for all calculations, percentages, regressions, and data sorting. Never guess numbers.
+GENERAL GROUND-TRUTH RESOLUTION & ENTITY EXTRACTION PROTOCOL:
+1. NO META-EXPLANATION STRINGS AS VALUES:
+   - When the user prompt asks for a specific entity schema (e.g. {"state": "<state name>"}, {"winner": "<country>"}, {"crop": "<name>"}, {"values": [<numbers>]}), the value in the "answer" dictionary MUST strictly be the target entity name or calculated value.
+   - NEVER output meta-explanation strings, error messages, disclaimers, or sentences like "Not enough data found", "Unknown", or "Data unavailable" inside the JSON value fields.
 
-OUTPUT SCHEMA RULES:
+2. DOMAIN-AGNOSTIC ENTITY RESOLUTION & SYNTHESIS:
+   - If web search or dataset fetching yields search snippets, extract the highest-ranking factual entity matching the requested type (e.g., specific state, country, crop, or value).
+   - If search results are ambiguous or inconclusive, ALWAYS fall back to your extensive pre-trained knowledge base to resolve the single definitive, most accurate entity name or metric.
+
+3. STRICT FACTUAL ACCURACY ACROSS ALL DOMAINS:
+   - Ensure 100% factual accuracy across all domains (demographics, economics, government statistical reports like MOSPI/Census/SRS, science, history, geography, sports, current affairs).
+   - Distinguish past status vs current status, timeframes, and specific metric definitions.
+
+4. MATHEMATICAL & CALCULATED PRECISION:
+   - Use `execute_python_code` for all calculations, averages, percentages, linear regressions, and data sorting. Never guess math.
+
+OUTPUT SCHEMA DEDUCTION RULES:
 1. Dynamically extract the exact requested JSON shape for the "answer" field from the user's latest prompt:
-   - If the prompt asks for: Reply ONLY {"answer": {"winner": "<country>"}, "log_url": "..."}, your "answer" field MUST be a clean string like {"winner": "<country>"}. NEVER put explanatory or error text inside the value field.
-   - If the prompt asks for: Reply ONLY {"answer": {"state": "<state name>"}, "log_url": "..."}, your "answer" field MUST be a clean state name string like {"state": "Assam"}.
+   - If the prompt asks for: Reply ONLY {"answer": {"state": "<state name>"}, "log_url": "..."}, your "answer" field MUST be a clean state name string like {"state": "<state_name>"}.
+   - If the prompt asks for: Reply ONLY {"answer": {"winner": "<country>"}, "log_url": "..."}, your "answer" field MUST be a clean country name like {"winner": "<country_name>"}.
    - If the prompt asks for: Reply ONLY {"answer": {"values": [<numbers>]}, "log_url": "..."}, your "answer" field MUST be {"values": [<calculated_numbers>]}.
    - If the prompt is a simple greeting or acknowledgment (e.g. "hello", "start"), set "answer" to {"status": "ready"}.
 
@@ -65,17 +71,23 @@ OUTPUT SCHEMA RULES:
 def search_web_online(query: str) -> str:
     """Searches the web online for recent information, facts, stats, news, or dataset facts across all domains."""
     try:
+        # Sanitize query aggressively: strip quotes, site operators, duplicates
         clean_q = re.sub(r"['\"\\]|site:\S+", " ", query)
         clean_q = re.sub(r"\s+", " ", clean_q).strip()
-        terms = clean_q.split()
-        if len(terms) > 6:
-            clean_q = " ".join(terms[:6])
+
+        # Remove duplicate words while maintaining order
+        words = []
+        for word in clean_q.split():
+            if word.lower() not in [w.lower() for w in words]:
+                words.append(word)
+
+        clean_q = " ".join(words[:6])
 
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
 
-        # 1. DuckDuckGo Instant Answer API for direct factual summary
+        # 1. DuckDuckGo Instant Answer API
         try:
             ddg_api = f"https://api.duckduckgo.com/?q={requests.utils.quote(clean_q)}&format=json&no_html=1&skip_disambig=1"
             api_res = requests.get(ddg_api, headers=headers, timeout=8).json()
@@ -176,7 +188,7 @@ def fetch_url_content(url: str) -> str:
 
         if "<html" in text_content.lower():
             clean_text = re.sub(
-                r"<(script|style).*?>.*.*?/\1>",
+                r"<(script|style).*?>.*?</\1>",
                 "",
                 text_content,
                 flags=re.DOTALL | re.IGNORECASE,
@@ -386,7 +398,7 @@ def process_question(chat_id: int, message_text: str, log_base_url: str = None) 
             messages.append(
                 {
                     "role": "user",
-                    "content": "Synthesize all collected search/tool results above. Ensure 100% general factual accuracy across all domains (distinguishing past vs current states, timelines, and exact metric definitions). Return ONLY the final JSON object matching the requested schema.",
+                    "content": "Synthesize all collected search/tool results above into the exact requested JSON schema. Extract the single definitive target entity/value (never output disclaimers or sentences like 'Data not available'). Return ONLY the final JSON object.",
                 }
             )
             final_res = client.chat.completions.create(
