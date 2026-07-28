@@ -29,13 +29,14 @@ MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 conversation_history: dict[int, list[dict]] = {}
 
 SYSTEM_INSTRUCTION = """
-You are an expert Data Analyst LLM Agent equipped with Python code execution and URL data fetching tools.
+You are an expert Data Analyst LLM Agent equipped with Python code execution, URL data fetching, and live web search tools.
 
-ANALYTICAL & KNOWLEDGE FALLBACK WORKFLOW:
+ANALYTICAL & ONLINE LOOKUP WORKFLOW:
 1. Parse the incoming message and full conversation history.
-2. If the user prompt contains a specific URL, use the `fetch_url_content` tool to download and inspect the dataset.
-3. If `fetch_url_content` fails (e.g., 404 Not Found) or if no working URL is provided in the prompt, DO NOT return "Unknown", "N/A", or "Error". Immediately fall back to your extensive internal knowledge base and reasoning to answer the question accurately (e.g. "Assam" for the state with highest maternal mortality rate in MOSPI/SRS data).
-4. Use the `execute_python_code` tool to perform precise mathematical calculations, statistics, data filtering, sorting, or forecasting when data tables or lists are available. Never guess numbers.
+2. ONLINE SEARCH MANDATE: Whenever asked for recent, current, or real-world information (e.g. 2026 World Cup statistics, current sports results, latest MOSPI reports, recent news/facts) that may not be in your static pre-training weights or when no dataset is provided in the prompt:
+   - YOU MUST call `search_web_online` to look up the latest live information online.
+3. If the user prompt contains a specific URL, use the `fetch_url_content` tool to download and inspect the dataset.
+4. Use the `execute_python_code` tool to perform precise mathematical calculations, statistics, data filtering, sorting, or forecasting when numbers or tables are available. Never guess math.
 
 OUTPUT SCHEMA DEDUCTION RULES:
 1. Dynamically extract the exact requested JSON shape for the "answer" field from the user's latest prompt:
@@ -55,6 +56,45 @@ OUTPUT SCHEMA DEDUCTION RULES:
 # -------------------------------------------------------------------
 # TOOL DEFINITIONS FOR OPENAI AGENT
 # -------------------------------------------------------------------
+
+
+def search_web_online(query: str) -> str:
+    """Searches the web online for recent information, sports results, 2026 stats, news, or public dataset information."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
+        # 1. DuckDuckGo HTML Search for zero-key web search
+        search_url = (
+            f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+        )
+        res = requests.get(search_url, headers=headers, timeout=10)
+
+        if res.status_code == 200:
+            snippets = re.findall(
+                r'<a class="result__snippet[^"]*"[^>]*>(.*?)</a>', res.text, re.DOTALL
+            )
+            clean_snippets = [re.sub(r"<[^>]+>", "", s).strip() for s in snippets[:5]]
+            if clean_snippets:
+                return "Web Search Results:\n" + "\n".join(
+                    [f"- {s}" for s in clean_snippets]
+                )
+
+        # 2. Wikipedia API Search fallback
+        wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={requests.utils.quote(query)}&format=json"
+        w_res = requests.get(wiki_url, headers=headers, timeout=10).json()
+        search_hits = w_res.get("query", {}).get("search", [])
+        if search_hits:
+            return "Wikipedia Search Results:\n" + "\n".join(
+                [
+                    f"- {h['title']}: {re.sub(r'<[^>]+>', '', h['snippet'])}"
+                    for h in search_hits[:4]
+                ]
+            )
+
+        return "No online search results found."
+    except Exception as e:
+        return f"Web search error: {e}"
 
 
 def execute_python_code(code: str) -> str:
@@ -101,20 +141,54 @@ def execute_python_code(code: str) -> str:
 
 
 def fetch_url_content(url: str) -> str:
-    """Fetches CSV, JSON, or text data from a public URL."""
+    """Fetches CSV, JSON, or text data from a public URL using browser User-Agent headers."""
     try:
-        response = requests.get(url, timeout=10)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+        response = requests.get(url, headers=headers, timeout=12)
         response.raise_for_status()
         text_content = response.text
+
+        if "<html" in text_content.lower():
+            clean_text = re.sub(
+                r"<(script|style).*?>.*?</\1>",
+                "",
+                text_content,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            clean_text = re.sub(r"<[^>]+>", " ", clean_text)
+            clean_text = re.sub(r"\s+", " ", clean_text).strip()
+            text_content = clean_text
+
         if len(text_content) > 10000:
             return text_content[:10000] + "\n...[truncated]"
         return text_content
     except Exception as e:
-        return f"Fetch Failed for {url}: {e}. (Use internal knowledge base to resolve answer)."
+        return f"Fetch Failed for {url}: {e}."
 
 
 # Tool Schemas for OpenAI Function Calling
 TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web_online",
+            "description": "Searches the live web online for recent events, 2026 sports results, public dataset facts, or current information not in training data.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query keywords to lookup online.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -178,7 +252,7 @@ def clean_json_response(raw_text: str) -> dict:
 
 def process_question(chat_id: int, message_text: str, log_base_url: str = None) -> str:
     """
-    Main Agent Entrypoint using OpenAI API with Function Calling Tools.
+    Main Agent Entrypoint using OpenAI API with Function Calling Tools (Web Search + Python + URL Fetcher).
     """
     run_logger = JSONLLogger(log_base_url=log_base_url)
     run_logger.log("start", {"chat_id": chat_id, "message": message_text})
@@ -212,7 +286,11 @@ def process_question(chat_id: int, message_text: str, log_base_url: str = None) 
             "llm_call_initiated",
             {
                 "model": MODEL_NAME,
-                "tools_enabled": ["execute_python_code", "fetch_url_content"],
+                "tools_enabled": [
+                    "search_web_online",
+                    "execute_python_code",
+                    "fetch_url_content",
+                ],
             },
         )
 
@@ -261,7 +339,9 @@ def process_question(chat_id: int, message_text: str, log_base_url: str = None) 
                     "tool_call_executed", {"name": function_name, "args": function_args}
                 )
 
-                if function_name == "execute_python_code":
+                if function_name == "search_web_online":
+                    tool_result = search_web_online(function_args.get("query", ""))
+                elif function_name == "execute_python_code":
                     tool_result = execute_python_code(function_args.get("code", ""))
                 elif function_name == "fetch_url_content":
                     tool_result = fetch_url_content(function_args.get("url", ""))
