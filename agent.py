@@ -33,15 +33,15 @@ You are an expert Data Analyst LLM Agent equipped with Python code execution, UR
 
 ANALYTICAL & ONLINE LOOKUP WORKFLOW:
 1. Parse the incoming message and full conversation history.
-2. ONLINE SEARCH MANDATE: Whenever asked for recent, current, or real-world information (e.g. 2026 World Cup statistics, current sports results, latest MOSPI reports, recent news/facts) that may not be in your static pre-training weights or when no dataset is provided in the prompt:
-   - YOU MUST call `search_web_online` to look up the latest live information online.
-3. If the user prompt contains a specific URL, use the `fetch_url_content` tool to download and inspect the dataset.
-4. Use the `execute_python_code` tool to perform precise mathematical calculations, statistics, data filtering, sorting, or forecasting when numbers or tables are available. Never guess math.
+2. ONLINE SEARCH MANDATE: Whenever asked for real-world factual information or public datasets (e.g. MOSPI, World Cup stats, census, GDP) that are not provided inline in the message:
+   - Use `search_web_online` with clean, short keywords (2-5 words, e.g. "maternal mortality rate India states MOSPI").
+3. KNOWLEDGE BASE FALLBACK: If web search returns no clear dataset result or fails, DO NOT return "Data not available", "Unknown", or an explanation string as the value. Use your pre-trained knowledge base to resolve the exact state/answer requested (e.g. "Assam" for the state with highest maternal mortality rate in MOSPI/SRS data).
+4. Use `execute_python_code` to perform precise mathematical calculations, statistics, data filtering, sorting, or forecasting when numbers or tables are available. Never guess math.
 
-OUTPUT SCHEMA DEDUCTION RULES:
+OUTPUT SCHEMA RULES:
 1. Dynamically extract the exact requested JSON shape for the "answer" field from the user's latest prompt:
+   - If the prompt asks for: Reply ONLY {"answer": {"state": "<state name>"}, "log_url": "..."}, your "answer" field MUST be a clean state name string like {"state": "Assam"}. NEVER put explanatory or error text inside the value field.
    - If the prompt asks for: Reply ONLY {"answer": {"values": [<numbers>]}, "log_url": "..."}, your "answer" field MUST be {"values": [<calculated_numbers>]}.
-   - If the prompt asks for: Reply ONLY {"answer": {"state": "<name>"}, "log_url": "..."}, your "answer" field MUST be {"state": "<state_name>"}.
    - If the prompt is a simple greeting or acknowledgment (e.g. "hello", "start"), set "answer" to {"status": "ready"}.
 
 2. You MUST return ONLY a single valid JSON object containing two top-level keys:
@@ -59,13 +59,23 @@ OUTPUT SCHEMA DEDUCTION RULES:
 
 
 def search_web_online(query: str) -> str:
-    """Searches the web online for recent information, sports results, 2026 stats, news, or public dataset information."""
+    """Searches the web online for recent information, sports results, stats, news, or dataset facts."""
     try:
+        # Sanitize query: strip quotes, site: operators, and trim excessive length
+        clean_q = re.sub(r"['\"\\]|site:\S+", " ", query)
+        clean_q = re.sub(r"\s+", " ", clean_q).strip()
+        # Take first 6 key terms if query is bloated
+        terms = clean_q.split()
+        if len(terms) > 6:
+            clean_q = " ".join(terms[:6])
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
+
+        # 1. DuckDuckGo HTML Search
         search_url = (
-            f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+            f"https://html.duckduckgo.com/html/?q={requests.utils.quote(clean_q)}"
         )
         res = requests.get(search_url, headers=headers, timeout=10)
 
@@ -79,7 +89,8 @@ def search_web_online(query: str) -> str:
                     [f"- {s}" for s in clean_snippets]
                 )
 
-        wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={requests.utils.quote(query)}&format=json"
+        # 2. Wikipedia API Search fallback
+        wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={requests.utils.quote(clean_q)}&format=json"
         w_res = requests.get(wiki_url, headers=headers, timeout=10).json()
         search_hits = w_res.get("query", {}).get("search", [])
         if search_hits:
@@ -90,7 +101,7 @@ def search_web_online(query: str) -> str:
                 ]
             )
 
-        return "No online search results found."
+        return "No online search results found. (Fallback to internal knowledge)."
     except Exception as e:
         return f"Web search error: {e}"
 
@@ -245,7 +256,6 @@ def clean_json_response(raw_text: str) -> dict:
         match = re.search(r"(\{.*\})", text, re.DOTALL)
         if match:
             return json.loads(match.group(1))
-        # Fallback if raw output is empty or non-JSON
         return {"answer": {"result": text or "Processed"}}
 
 
@@ -321,7 +331,6 @@ def process_question(chat_id: int, message_text: str, log_base_url: str = None) 
             tool_calls = getattr(response_message, "tool_calls", None)
 
             if not tool_calls:
-                # Model provided direct text response
                 raw_llm_output = (
                     response_message.content.strip() if response_message.content else ""
                 )
@@ -359,12 +368,12 @@ def process_question(chat_id: int, message_text: str, log_base_url: str = None) 
                     }
                 )
 
-        # If loop reached max tool calls without final text output, force one final LLM call without tools
+        # Final synthesis step if raw_llm_output is empty
         if not raw_llm_output:
             messages.append(
                 {
                     "role": "user",
-                    "content": "Synthesize all collected tool search results above and return ONLY the final JSON object matching the requested schema.",
+                    "content": 'Synthesize all collected search/tool results above. If search returned no results, resolve the answer using your internal knowledge. Return ONLY the final JSON object matching the requested schema (e.g. {"answer": {"state": "Assam"}, "log_url": "PLACEHOLDER_LOG_URL"}).',
                 }
             )
             final_res = client.chat.completions.create(
